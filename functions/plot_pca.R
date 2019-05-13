@@ -16,7 +16,7 @@
 
 # Function ----------------------------------------------------------------
 
-plot_pca <- function(tb, plot_title) {
+plot_pca <- function(tb, plot_title, group_color) {
   
   library(tidyverse)
   library(purrr)
@@ -30,7 +30,7 @@ plot_pca <- function(tb, plot_title) {
         ~ autoplot(
           .x,
           data         = .y,
-          colour       = "group",
+          colour       = group_color,
           size         = 3,
           loadings     = FALSE,
           label        = TRUE,
