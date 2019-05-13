@@ -13,9 +13,7 @@
 
 # tb = imputed data generated with get_df_wide
 # num_samples = numeric, number of samples
-# variables = character vector, use c(), vector with group names should
-# end with "sample"
-
+# variables = character vector, use c(), vector with group names
 
 # Function ----------------------------------------------------------------
 
@@ -39,20 +37,20 @@ format_data_for_PCA <- function(tb, num_samples, variables) {
   # Remove name row
   temp <- temp[-1, ]
   
-  # Make all intenisity columns numeric
+  # Make all intensity columns numeric
   temp[, -1] <- temp[, -1] %>% 
     mutate_all(.funs = as.numeric)
   
   # Separate name column into each variable and join all except sample number
   temp <- temp %>% 
     separate(name, into = variables, sep = "_") %>% 
-    unite(col = "group", paste(variables[-length(variables)]))
+    unite(col = "group", paste(variables[-1]), remove = FALSE)
   
   # Perform PCA
   temp <- temp %>% 
     nest() %>% # Nest data
     mutate(
-      pca = map(data, ~ prcomp(.x %>% dplyr::select(-group:-sample),
+      pca = map(data, ~ prcomp(.x %>% dplyr::select(-sample:-litter),
                                scale = TRUE, center = TRUE)), # Perform PCA
       pca_aug = map2(pca, data, ~ augment(.x, data = .y)) # Extract PCA
     )
