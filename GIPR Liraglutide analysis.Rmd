@@ -1,0 +1,317 @@
+---
+title: "GIPR Liraglutide analysis"
+author: "Erik Ländström"
+date: "7 March 2019"
+output: 
+  html_document:
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries 
+
+```{r library, message = FALSE}
+library(tidyverse)
+library(biomaRt)
+library(knitr)
+library(kableExtra)
+library(DEP)
+library(readxl)
+library(qvalue)
+library(kableExtra)
+library(naniar)
+```
+
+# 1 Preprocessing
+Read data with gene names and GOs from biodbnet["https://biodbnet-abcc.ncifcrf.gov/db/db2db.php"].
+
+```{r read_data}
+# Read data
+data_raw <- read_tsv("proteinGroups_with_gene_names_and_GOs.txt")
+
+# Quick look at data columns
+glimpse(data_raw)
+```
+
+Remove all protein groups without a gene name (or locus name).
+
+```{r remove}
+filtered_data <- data_raw %>% 
+  dplyr::filter(!is.na(gene_name))
+```
+
+Get gene names from biomaRt and replace any locus names with the new gene names.
+
+```{r}
+# Remove isoform from refseq identifier
+filtered_data <- filtered_data %>%
+  mutate(Protein_ID = str_extract(`Majority protein IDs`, "NP_[0-9]+|XP_[0-9]+"))
+```
+
+Extract gene names from biomart.
+
+```{r mart_func, echo = FALSE}
+convert_NCBIIDs_to_gene_names <- function(tb) {
+  
+  # Load sus scrofa dataset from biomaRt and change column name to Protein_ID
+  ensembl <- useMart("ensembl", dataset = "sscrofa_gene_ensembl")  
+  
+  # Get gene names for peptide IDs
+  NP <- as_tibble(getBM(attributes = c("refseq_peptide", "external_gene_name"),
+              filters = "refseq_peptide",
+              values = tb,
+              mart = ensembl
+              ))
+  
+  NP <- NP %>%
+    rename(Protein_ID = refseq_peptide)
+  
+  # Load sus scrofa dataset from biomaRt and change column name to Protein_ID
+  XP <- as_tibble(getBM(attributes = c("refseq_peptide_predicted", "external_gene_name"),
+              filters = "refseq_peptide_predicted",
+              values = tb,
+              mart = ensembl
+              ))
+  
+  XP <- XP %>%
+    rename(Protein_ID = refseq_peptide_predicted)
+  
+  # Use full_join to join the two tables
+  gene_names <- full_join(NP, XP, by = "Protein_ID")
+  
+  # Tidy data, gene names in one column and remove NAs
+  gene_names <- gene_names %>%
+    gather(external_gene_name.x, external_gene_name.y, key = "Source", value = "Gene_name") %>%
+    dplyr::select(Protein_ID, Gene_name) %>%
+    dplyr::filter(!is.na(Gene_name)) 
+  
+  # If there are any "" artifacts from the biomaRt search, replace them with NA
+  gene_names[gene_names == ""] <- NA
+  
+  # Save output in a tibble
+  gene_names <<- gene_names
+}
+```
+
+```{r mart_convert}
+# Find gene names using biomart
+convert_NCBIIDs_to_gene_names(filtered_data$Protein_ID)
+
+# Join with filtered data
+filtered_data <- full_join(filtered_data, gene_names, by = "Protein_ID")
+```
+
+Replace loci and months with gene names from biomaRt (if any).
+
+```{r sub_biomart_names}
+data <- filtered_data %>% 
+  rename(gene_name_biomart = Gene_name) %>%
+  mutate(gene = if_else(str_detect(gene_name, "LOC.+") & !is.na(gene_name_biomart), gene_name_biomart, gene_name),
+         gene = if_else(str_detect(gene, "[A-Za-z]+ [0-9]+"), gene_name_biomart, gene))
+```
+
+```{r unique}
+# Make unique gene names (not sure if this is necessary with DEP)
+data <- make_unique(data, "gene", "Protein_ID")
+```
+
+## Create experimental design
+
+Create an experimental design file for `DEP`.
+
+```{r read_animals, eval = FALSE}
+library(readxl)
+
+animal_list <- read_xlsx("Animal List young group.xlsx")
+
+animal_list %>% 
+  mutate(Group = str_extract(Group, "[A-Z]"),
+         Gender = str_extract(Gender, "[a-z]"),
+         Litter = str_extract(Litter, "[0-9]")) %>% 
+  dplyr::filter(ID != 1495) %>% # Since it was a muscle sample
+  unite(col = "label", Group, ID, sep = "_", remove = FALSE) %>% 
+  unite(col = "group", Group, Gender, Series, Litter) %>% 
+  rename(replicate = ID,
+         condition = group) %>% 
+  dplyr::select(label, condition, replicate) %>% 
+  write_tsv("experimental_design_GIPR_liraglutide.txt")
+```
+
+Create a summarized experiment.
+
+```{r SExperiment}
+# Grep for lfq columns
+lfq_columns <- grep("LFQ.", colnames(data))
+
+# Read experimental design
+experimental_design <- read_tsv("experimental_design_GIPR_liraglutide.txt")
+experimental_design
+
+# Generate summarized experiment
+data_se <- make_se(data, lfq_columns, experimental_design)
+data_se
+```
+
+# 2 Analysis of summarized experiment
+
+## 2.1 Missing value filtering
+
+Plot protein identification overlap plot.
+
+```{r frequency}
+plot_frequency(data_se)
+```
+
+Filter data on valid values.
+
+```{r count_data}
+# Calculate valid values per protein and treatment 
+count_data <- data %>% 
+  gather(`LFQ intensity L_1312`:`LFQ intensity P_1505`, key = "sample", value = "intensity") %>% 
+  dplyr::select(name, sample, intensity) %>% 
+  mutate(treatment = str_extract(sample, "[A-Z]_"),
+         intensity = log2(intensity)) %>% 
+  replace_with_na(replace = list(intensity = -Inf)) %>% 
+  group_by(name, treatment) %>% 
+  summarise(counts = sum(!is.na(intensity)))
+```
+
+I will choose valid values 5 per group, that was what I did last time in 
+Perseus, and 1 missing value to compare with.
+
+```{r count_vv}
+# Filter for 5 valid values
+list_5vv <- count_data %>% 
+  spread(key = "treatment", value = "counts") %>% 
+  dplyr::filter(L_ >= 5 | P_ >= 5)
+
+# Filter for one missing value
+list_1mv <- count_data %>% 
+  spread(key = "treatment", value = "counts") %>% 
+  dplyr::filter(L_ >= 7 | P_ >= 8)
+```
+
+## 2.2 Analysis of 5 valid values
+
+```{r make_se}
+data_5vv <- left_join(list_5vv, data, by = "name")
+
+# Grep for lfq columns
+lfq_columns <- grep("LFQ.", colnames(data_5vv))
+
+data_5vv_se <- make_se(data_5vv, lfq_columns, experimental_design)
+```
+
+```{r plots 2}
+plot_frequency(data_5vv_se)
+plot_numbers(data_5vv_se)
+plot_coverage(data_5vv_se)
+plot_detect(data_5vv_se)
+```
+
+Normalize with `vsn`.
+
+```{r norm}
+data_5vv_norm <- normalize_vsn(data_5vv_se)
+meanSdPlot(data_5vv_se)
+meanSdPlot(data_5vv_norm)
+plot_normalization(data_5vv_se, data_5vv_norm)
+```
+
+```{r plot_mv2}
+plot_missval(data_5vv_norm)
+```
+
+Imputation.
+
+```{r}
+imputed_data_5vv <- impute(data_5vv_norm, fun = "man", shift = 1.8, scale = 0.3)
+
+plot_imputation(data_5vv_norm, imputed_data_5vv)
+```
+
+Save imputed data.
+
+```{r}
+imputed_data_5vv_long <- get_df_long(imputed_data_5vv)
+
+write_tsv(imputed_data_5vv_long, "GIPR_liraglutide_liver_5vv_imputed.tsv")
+```
+
+## 2.2 Analysis of 5 valid values
+
+```{r make_se1}
+data_1mv <- left_join(list_1mv, data, by = "name")
+
+# Grep for lfq columns
+lfq_columns <- grep("LFQ.", colnames(data_1mv))
+
+data_1mv_se <- make_se(data_1mv, lfq_columns, experimental_design)
+```
+
+```{r plots 1}
+plot_frequency(data_1mv_se)
+plot_numbers(data_1mv_se)
+plot_coverage(data_1mv_se)
+plot_detect(data_1mv_se)
+```
+
+Normalize with `vsn`.
+
+```{r norm2}
+data_1mv_norm <- normalize_vsn(data_1mv_se)
+meanSdPlot(data_1mv_se)
+meanSdPlot(data_1mv_norm)
+plot_normalization(data_1mv_se, data_1mv_norm)
+```
+
+```{r plot_mv}
+plot_missval(data_1mv_norm)
+```
+
+Imputation.
+
+```{r}
+imputed_data_1mv <- impute(data_1mv_norm, fun = "man", shift = 1.8, scale = 0.3)
+
+plot_imputation(data_1mv_norm, imputed_data_1mv)
+```
+
+Save imputed data.
+
+```{r}
+imputed_data_1mv_long <- get_df_long(imputed_data_1mv)
+
+write_tsv(imputed_data_1mv_long, "GIPR_liraglutide_liver_1mv_imputed.tsv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
