@@ -1,0 +1,393 @@
+---
+title: "GIPR statistical analysis 5vv"
+author: "Erik Ländström"
+date: "8 March 2019"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Read libraries.
+
+```{r library, message = FALSE}
+library(tidyverse)
+library(modelr)
+library(broom)
+library(ggfortify)
+library(sva)
+library(qvalue)
+```
+
+Read functions.
+
+```{r functions, echo = FALSE}
+source("functions/separate_condition_from_DEP_output.R")
+source("functions/format_data_for_PCA.R")
+source("functions/plot_var_exp.R")
+source("functions/make_var_exp_kable.R")
+source("functions/calculate_variance_explained.R")
+source("functions/plot_pca.R")
+source("functions/plot_multiple_PCAs.R")
+source("functions/multiple_ttests.R")
+source("functions/fdr_correction_with_qvalue.R")
+source("functions/plot_pvalue_histogram.R")
+```
+
+# Analysis
+
+Perform statistical analysis of imputed data with at least 5 valid values per 
+group.
+
+Read data.
+
+```{r message = FALSE}
+data <- read_tsv("GIPR_liraglutide_liver_5vv_imputed.tsv")
+```
+
+Separate conditions into separate columns.
+
+```{r sep_col}
+factored_data <- separate_condition_from_DEP_output(data, c("treatment", "gender", "series", "litter"), remove = FALSE)
+```
+
+
+## Linear model
+
+Nest data.
+
+```{r}
+nested_data <- factored_data %>% 
+  group_by(name) %>% 
+  nest()
+```
+
+Linear model function.
+
+```{r func}
+protein_model <- function(tb) {
+  lm(LFQ ~ gender * litter, data = tb)
+}
+```
+
+Perform linear regression on each protein and calculate/extract residuals.
+
+```{r lming}
+nested_model_data <- nested_data %>% 
+  mutate(model = map(data, protein_model))
+
+nested_resids_data <- nested_model_data %>% 
+  mutate(resids = map2(data, model, add_residuals))
+
+resids <- unnest(nested_resids_data, resids)
+```
+
+Calculate variance and compare with original data.
+
+```{r var}
+variance <- resids %>% 
+  group_by(name) %>% 
+  summarise(var_lfq = var(LFQ),
+            var_resid = var(resid))
+
+variance %>% 
+  summarise(mean_lfq = mean(var_lfq),
+            mean_resid = mean(var_resid))
+
+# Test if the regression reduced the variance for all proteins
+variance %>% 
+  mutate(smaller = if_else(var_resid < var_lfq, 1, 0)) %>% 
+  summarise(n = sum(smaller),
+            all = n())
+
+resids %>% 
+  group_by(name, treatment) %>% 
+  summarise(var_lfq = var(LFQ),
+            var_resid = var(resid))
+```
+
+The linear model decreased the variance for every protein!
+
+## PCA
+
+Unite replicate (ID) with condition (grouping), and spread to intensities into
+separate columns for each sample.
+
+```{r pca_prep}
+lfq_for_pca <- resids %>% 
+  dplyr::select(name, replicate, condition, LFQ) %>% 
+  unite(replicate, replicate, condition) %>% 
+  spread(key = "replicate", value = "LFQ")
+
+resids_for_pca <- resids %>% 
+  dplyr::select(name, replicate, condition, resid) %>% 
+  unite(replicate, replicate, condition) %>% 
+  spread(key = "replicate", value = "resid")
+```
+
+
+Perform PCA for both LFQ and residuals.
+
+```{r pca}
+lfq_pca <- format_data_for_PCA(lfq_for_pca, 17, c("sample", "treatment", "gender", "series", "litter"))
+
+resid_pca <- format_data_for_PCA(resids_for_pca, 17, c("sample", "treatment", "gender", "series", "litter"))
+```
+
+
+Calculate the variance explained by each principal component for original and
+data processed with linear regression.
+
+```{r var_exp}
+# Calculate the variance that each PC explains
+lfq_var_exp <- calculate_variance_explained(lfq_pca)
+make_var_exp_kable(lfq_var_exp)
+
+resid_var_exp <- calculate_variance_explained(resid_pca)
+make_var_exp_kable(resid_var_exp)
+
+# Plot variance explained plots
+plot_var_exp(lfq_var_exp)
+plot_var_exp(resid_var_exp)
+```
+
+The principal components from the linear model explains considerably more of the
+variance than the LFQ intensities.
+
+
+Plot the first two PCs of the PCA.
+
+```{r plot_pca}
+plot_pca(lfq_pca, "LFQ", "treatment")
+plot_pca(resid_pca, "resids", "treatment")
+```
+
+
+
+Plot PC1 to PC4.
+
+```{r plot_pcas}
+plot_multiple_PCAs(lfq_pca, 1, 4, "treatment")
+plot_multiple_PCAs(resid_pca, 1, 4, "treatment")
+```
+
+
+# Surrogate variable analysis
+
+Format data for sva.
+
+Create expression data.
+
+```{r exp_data}
+exp_data <- resids %>% 
+  dplyr::select(name, replicate, LFQ) %>% 
+  spread(key = "replicate", value = "LFQ")
+
+row.names(exp_data) <- exp_data$name
+
+exp_data <- exp_data %>% 
+  dplyr::select(-name)
+```
+
+Create phenotypic data.
+
+```{r pheno}
+pheno_data <- resids %>% 
+  dplyr::select(treatment, gender, series, litter, replicate) %>% 
+  distinct() %>% 
+  mutate(sample = row_number())
+
+rownames(pheno_data) <- pheno_data$replicate
+
+pheno_data <- pheno_data %>% 
+  dplyr::select(sample, treatment, gender, series, litter)
+```
+
+Create linear models, full and null model.
+
+```{r lm}
+mod = model.matrix(~ as.factor(treatment), data = pheno_data)
+
+mod0 = model.matrix(~ 1,data = pheno_data)
+```
+
+Sva using LFQ values
+
+```{r sva}
+svobj = sva(as.matrix(exp_data), mod, mod0, n.sv= 2)
+svobj[[1]]
+```
+
+Sva using LFQ plus the known batch effects: gender and series.
+
+```{r lm_known}
+mod = model.matrix(~ as.factor(treatment) * as.factor(gender) * as.factor(series), data = pheno_data)
+
+mod0 = model.matrix(~ as.factor(gender) * as.factor(series),data = pheno_data)
+
+svobj = sva(as.matrix(exp_data), mod, mod0, n.sv= 2)
+svobj[[1]]
+```
+
+Sva analysis using residuals from linear model.
+
+```{r sva_lm}
+exp_resids <- resids %>% 
+  dplyr::select(name, replicate, resid) %>% 
+  spread(key = "replicate", value = "resid")
+
+row.names(exp_resids) <- exp_resids$name
+
+exp_resids <- exp_resids %>% 
+  dplyr::select(-name)
+
+mod = model.matrix(~ as.factor(treatment), data = pheno_data)
+
+mod0 = model.matrix(~ 1,data = pheno_data)
+
+svobj = sva(as.matrix(exp_resids), mod, mod0, n.sv= 2)
+svobj[[1]]
+
+sv_factor1 <- tibble(replicate = as.numeric(rownames(pheno_data)),
+       sv1 = svobj[[1]][, 1])
+```
+
+Join sva factor sv1 with previous results.
+
+```{r sva_resid}
+resids_sv <- full_join(resids, sv_factor1, by = "replicate")
+```
+
+Nest data.
+
+```{r nest}
+nested_data <- resids_sv %>% 
+  group_by(name) %>% 
+  rename(resid_old = resid) %>% 
+  nest()
+```
+
+Linear model including the sv1 factor.
+
+```{r func2}
+protein_model <- function(tb) {
+  lm(resid_old ~ sv1, data = tb)
+}
+```
+
+Perform linear model.
+
+```{r lming2}
+nested_model_data <- nested_data %>% 
+  mutate(model = map(data, protein_model))
+
+nested_resids_data <- nested_model_data %>% 
+  mutate(resids = map2(data, model, add_residuals))
+
+residuals_sv <- unnest(nested_resids_data, resids)
+```
+
+Calculate variance.
+
+```{r var2}
+variance <- resids %>% 
+  group_by(name) %>% 
+  summarise(var_lfq = var(LFQ),
+            var_resid = var(resid))
+
+variance %>% 
+  summarise(mean_var_lfq = mean(var_lfq),
+            mean_var_resid = mean(var_resid))
+
+variance %>% 
+  mutate(smaller = if_else(var_resid < var_lfq, 1, 0)) %>% 
+  summarise(n = sum(smaller))
+
+resids %>% 
+  group_by(name, treatment) %>% 
+  summarise(var_lfq = var(LFQ),
+            var_resid = var(resid))
+```
+
+Calculate variance explained.
+
+```{r var_exp2}
+resids_sv_for_pca <- residuals_sv %>% 
+  dplyr::select(name, replicate, condition, resid) %>% 
+  unite(replicate, replicate, condition) %>% 
+  spread(key = "replicate", value = "resid")
+
+resid_sv_pca <- format_data_for_PCA(resids_sv_for_pca, 17, c("sample", "treatment", "gender", "series", "litter"))
+
+resid_sv_var_exp <- calculate_variance_explained(resid_sv_pca)
+make_var_exp_kable(resid_sv_var_exp)
+
+
+plot_var_exp(resid_sv_var_exp)
+```
+
+```{r}
+plot_pca(resid_sv_pca, "resids", "treatment")
+
+plot_multiple_PCAs(resid_pca, 1, 4, "treatment")
+plot_multiple_PCAs(resid_sv_pca, 1, 4, "treatment")
+```
+
+# t-test
+
+Perform multiple t-test.
+
+```{r ttest}
+residuals_sv_ttest <- multiple_ttests(residuals_sv, treatment,
+                group_1 = L,
+                group_2 = P,
+                mean_1 = mean_L,
+                mean_2 = mean_P,
+                values = resid,
+                equal_var = TRUE)
+```
+
+Plot p-value histogram.
+
+```{r phist}
+plot_pvalue_histogram(residuals_sv_ttest, p_value, limit_max = 600)
+```
+
+```{r}
+fdr_correction_with_qvalue <- function(tb, p_value_col) {
+  
+  # Quote
+  p_value_col <- enquo(p_value_col)
+  
+  # fdr correction
+  qvalues <- qvalue(as_vector(tb %>%
+                                ungroup() %>% # To make sure to only get one column
+                                dplyr::select(!!p_value_col)))
+  
+  return(qvalues)
+}
+```
+
+FDR correction
+```{r}
+q_vals <- fdr_correction_with_qvalue(residuals_sv_ttest, p_value) 
+```
+
+```{r}
+resids_ttest <- multiple_ttests(resids_sv, treatment,
+                group_1 = L,
+                group_2 = P,
+                mean_1 = mean_L,
+                mean_2 = mean_P,
+                values = resid,
+                equal_var = TRUE)
+```
+
+```{r ses_info, echo = FALSE}
+sessionInfo()
+```
+
+
