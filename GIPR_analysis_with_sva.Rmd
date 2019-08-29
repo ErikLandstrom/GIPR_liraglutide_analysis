@@ -174,6 +174,26 @@ plot_multiple_PCAs(lfq_pca, 1, 4, "treatment")
 plot_multiple_PCAs(resid_pca, 1, 4, "treatment")
 ```
 
+# t-test
+
+Perform multiple t-test.
+
+```{r ttest}
+residuals_ttest <- multiple_ttests(resids, treatment,
+                group_1 = L,
+                group_2 = P,
+                mean_1 = mean_L,
+                mean_2 = mean_P,
+                values = resid,
+                equal_var = TRUE)
+```
+
+Plot p-value histogram.
+
+```{r phist}
+plot_pvalue_histogram(residuals_ttest, p_value, limit_max = 600)
+```
+
 
 # Surrogate variable analysis
 
