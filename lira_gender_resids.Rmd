@@ -12,6 +12,7 @@ library(broom)
 library(ggfortify)
 library(sva)
 library(qvalue)
+library(ggrepel)
 ```
 
 Read functions.
@@ -176,7 +177,7 @@ Plot p-value histogram.
 plot_pvalue_histogram(residuals_ttest, p_value, limit_max = 600)
 ```
 
-```{r}
+```{r echo = FALSE}
 fdr_correction_with_qvalue <- function(tb, p_value_col) {
   
   # Quote
@@ -191,7 +192,7 @@ fdr_correction_with_qvalue <- function(tb, p_value_col) {
 }
 ```
 
-FDR correction
+FDR correction with `qvalue`.
 
 ```{r}
 q_vals <- fdr_correction_with_qvalue(residuals_ttest, p_value) 
@@ -204,6 +205,8 @@ make_qvalue_tibble <- function(tb) {
 }
 ```
 
+Join statistical test outputs with all data.
+
 ```{r}
 qvalues <- make_qvalue_tibble(q_vals)
 qvalues %>% arrange(qvalue)
@@ -213,16 +216,169 @@ resids_ttest <- full_join(residuals_ttest, qvalues, by = "p_value")
 all_data <- full_join(factored_data, resids_ttest, by = "name")
 ```
 
+# Join all data and make it ready for excel
+
+I need to join residuals with `all_data`.
+
+```{r}
+resids
+all_data <- full_join(all_data %>% unite(name, replicate, col = "join_by"),
+          resids %>% unite(name, replicate, col = "join_by") %>% 
+            select(join_by, resid),
+          by = "join_by") %>% 
+  separate(join_by, into = c("name", "replicate"), sep = "_")
+```
+
+Save `all_data`.
+
+```{r, eval = FALSe}
+write_tsv(all_data %>% 
+            select(-L, -P), "data/all_data_long_unstructured.txt")
+```
+
+Make wide LFQ and residuals `.txt` files.
+
+```{r}
+# Unique data
+unique_data <- all_data %>% 
+  select(-label:-litter, -replicate, -LFQ, -resid, -L, -P) %>% 
+  distinct()
+
+# LFQ
+lfq_wide <- all_data %>% 
+  select(name, treatment:replicate, LFQ) %>%
+  unite(treatment, gender, series, litter, replicate, col = "label") %>% 
+  spread(key = label, value = LFQ)
+
+lfq_wide <- full_join(lfq_wide, unique_data, by = "name")
+
+# residuals
+resids_wide <- all_data %>% 
+  select(name, treatment:replicate, resid) %>%
+  unite(treatment, gender, series, litter, replicate, col = "label") %>% 
+  spread(key = label, value = resid)
+
+resids_wide <- full_join(resids_wide, unique_data, by = "name")
+```
+
+Write wide `txt`files.
+
+```{r echo = FALSE}
+# LFQ
+write_tsv(lfq_wide, "data/gipr_lfq_wide.txt")
+
+# Residuals
+write_tsv(resids_wide, "data/gipr_resids_wide.txt")
+```
+
+# Filter for significant proteins
+
+```{r}
+resids_sig_wide <- resids_wide %>% 
+  filter(qvalue < 0.05)
+```
+
+```{r echo = FALSE}
+write_tsv(resids_sig_wide, "data/gipr_sig_resids_wide.txt")
+```
+
+## Filter for protein names
+
+```{r eval = FALSE}
+source("functions/filter_for_protein_name.R")
+
+lira_sig <- filter_for_protein_name(read_tsv("data/gipr_lira_sig.txt"))
+
+write_tsv(lira_sig, "data/gipr_lira_sig_for_thesis.txt")
+
+placebo_sig <- filter_for_protein_name(read_tsv("data/gipr_placebo_sig.txt"))
+
+write_tsv(placebo_sig, "data/gipr_placebo_sig_for_thesis.txt")
+```
+
+# Volcano plot
+
+```{r}
+source("functions/prepare_data_for_volcano_plot.R")
+source("functions/plo_fdr_volcano.R")
+```
+
+```{r}
+resids_volcano <- prepare_data_for_volcano_plot(resids_ttest, "Placebo", "Liraglutide")
+
+p <- plot_fdr_volcano(resids_volcano, plot_title = "", 
+                 break_vector = c("Placebo", "Liraglutide"),
+                 color_vector = c("#F8666D", "black", "#00BFC4"), 
+                 a = 0.75)
+p
+
+p1 <- p +
+  guides(color = FALSE) +
+  theme(axis.title = element_text(size = 18),
+        axis.text = element_text(size = 14))
+p1
+ggsave("GIPR_volcano_plot_without_labels.pdf", p1, device = "pdf")
+
+p2 <- p +
+  guides(color = FALSE) +
+  theme(axis.title = element_text(size = 18),
+        axis.text = element_text(size = 14)) +
+  geom_text_repel(data = resids_volcano %>% 
+                     filter(significant == "Placebo" | significant == "Liraglutide") %>% 
+                     filter(log2_difference < -0.8 | log2_difference > .8), aes(log2_difference, -log10(p_value),  label = name), color = "black")
+p2
+ggsave("GIPR_volcano_plot_with_labels.pdf", p2, device = "pdf")
+```
 
 
+```{r}
+resids_sig_wide %>% 
+  filter(qvalue < 0.05 & log2_difference > 0) %>% 
+  select(name, Protein_ID, log2_difference) %>% 
+  arrange(desc(log2_difference)) %>% View
+```
 
+# Make table for GSEA
 
+```{r, eval = FALSE}
+residuals_gsea <- resids %>%
+  select(name, label, resid) %>% 
+  spread(key = "label", "resid")
 
+write_tsv(residuals_gsea, "GIPR_liver_resids_table_for_gsea.txt")
+```
 
+```{r}
+resids
+```
 
+# Format GSEA output
 
+```{r, eval = FALSE}
+gsea_lira <- read_tsv("data/gipr_liraglutide_gsea.txt")
 
+gsea_lira <- gsea_lira %>% 
+  separate(Name, into = c("Category", "Name"), sep = "_", extra = "merge") %>% 
+  mutate(Name = tolower(Name),
+         Name = str_to_title(Name),
+         Name = str_replace_all(Name, "_", " "),
+         Name = str_replace_all(Name, "rna", "RNA"),
+         Name = str_replace_all(Name, "dna", "DNA"))
 
+write_tsv(gsea_lira, "gsea_lira_table_for_thesis.txt")
+
+placebo_gsea <- read_tsv("data/gipr_placebo_gsea.txt")
+
+placebo_gsea <- placebo_gsea %>% 
+  separate(Name, into = c("Category", "Name"), sep = "_", extra = "merge") %>% 
+  mutate(Name = tolower(Name),
+         Name = str_to_title(Name),
+         Name = str_replace_all(Name, "_", " "),
+         Name = str_replace_all(Name, "rna", "RNA"),
+         Name = str_replace_all(Name, "dna", "DNA"))
+
+write_tsv(placebo_gsea, "gipr_placebo_gsea_table_thesis.txt")
+```
 
 
 
